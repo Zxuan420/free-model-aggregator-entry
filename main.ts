@@ -35,6 +35,7 @@ import {
   openAItoGemini,
   openaiEventsFromAnthropic,
   openaiEventsFromGemini,
+  openaiEventsFromOpenAI,
   type ServedModel,
 } from './lib/wire.ts';
 
@@ -337,16 +338,7 @@ async function handleInference(
         } else {
           // OpenAI client request
           if (providerWire === 'openai') {
-            const reader = upstream.body.getReader();
-            try {
-              for (;;) {
-                const { value, done } = await reader.read();
-                if (done) break;
-                res.write(Buffer.from(value));
-              }
-            } finally {
-              reader.releaseLock();
-            }
+            for await (const event of openaiEventsFromOpenAI(upstream.body, requestedModel)) res.write(event);
           } else if (providerWire === 'anthropic') {
             for await (const event of openaiEventsFromAnthropic(upstream.body, requestedModel)) res.write(event);
           } else if (providerWire === 'gemini') {

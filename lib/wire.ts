@@ -576,12 +576,71 @@ export function sseEvent(event: string | null, data: unknown): string {
   return `${event === null ? '' : `event: ${event}\n`}data: ${JSON.stringify(data)}\n\n`;
 }
 
-/** Anthropic events from OpenAI upstream stream (already in starter, keep) */
-/** OpenAI events from Anthropic upstream stream */
-export async function* openaiEventsFromAnthropic(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+/** Read a whole upstream SSE body to text (TextDecoder streaming). */
+export async function collectStreamText(upstream: ReadableStream<Uint8Array>): Promise<string> {
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
-  let buffer = '';
+  let text = '';
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
+  return text;
+}
+
+export interface SseFrame {
+  event: string | null;
+  data: string;
+}
+
+/** Split a raw SSE byte stream (or text) into {event: string|null, data: string} frames. */
+export function parseSseFrames(text: string): SseFrame[] {
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const blocks = normalized.split(/\n\s*\n/);
+  const frames: SseFrame[] = [];
+
+  for (const block of blocks) {
+    if (!block.trim()) continue;
+    let currentEvent: string | null = null;
+    const dataLines: string[] = [];
+
+    for (const line of block.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith(':')) {
+        continue;
+      }
+      if (trimmed.startsWith('event:')) {
+        currentEvent = trimmed.slice(6).trim();
+      } else if (trimmed.startsWith('data:')) {
+        let data = trimmed.slice(5);
+        if (data.startsWith(' ')) {
+          data = data.slice(1);
+        }
+        dataLines.push(data);
+      }
+    }
+
+    if (dataLines.length > 0) {
+      frames.push({
+        event: currentEvent,
+        data: dataLines.join('\n'),
+      });
+    }
+  }
+
+  return frames;
+}
+
+/** OpenAI events from Anthropic upstream stream */
+export async function* openaiEventsFromAnthropic(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  const text = await collectStreamText(upstream);
+  const frames = parseSseFrames(text);
   let inputTokens = 0;
   let outputTokens = 0;
   let stopReason = 'stop';
@@ -589,21 +648,10 @@ export async function* openaiEventsFromAnthropic(upstream: ReadableStream<Uint8A
 
   const chatCmplId = `chatcmpl-${Math.random().toString(36).slice(2, 9)}`;
 
-  const eventsOfFrame = (frame: string): string[] => {
+  const processFrame = (frame: SseFrame): string[] => {
     const out: string[] = [];
-    let currentEvent: string | null = null;
-    let dataPayload: string | null = null;
-
-    for (const line of frame.split('\n')) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith('event:')) {
-        currentEvent = trimmed.slice(6).trim();
-      } else if (trimmed.startsWith('data:')) {
-        dataPayload = trimmed.slice(5).trim();
-      }
-    }
-
-    if (dataPayload === null) return out;
+    const dataPayload = frame.data;
+    if (dataPayload === '[DONE]') return out;
 
     let chunk: unknown;
     try {
@@ -613,11 +661,11 @@ export async function* openaiEventsFromAnthropic(upstream: ReadableStream<Uint8A
     }
     if (!isRecord(chunk)) return out;
 
-    if (currentEvent === 'message_start' || chunk.type === 'message_start') {
+    if (frame.event === 'message_start' || chunk.type === 'message_start') {
       const msg = isRecord(chunk.message) ? chunk.message : {};
       const usage = isRecord(msg.usage) ? msg.usage : {};
       inputTokens = numberOrZero(usage.input_tokens);
-    } else if (currentEvent === 'content_block_delta' || chunk.type === 'content_block_delta') {
+    } else if (frame.event === 'content_block_delta' || chunk.type === 'content_block_delta') {
       const delta = isRecord(chunk.delta) ? chunk.delta : {};
       if (delta.type === 'text_delta' && typeof delta.text === 'string' && delta.text !== '') {
         const openaiChunk = {
@@ -629,7 +677,7 @@ export async function* openaiEventsFromAnthropic(upstream: ReadableStream<Uint8A
         };
         out.push(`data: ${JSON.stringify(openaiChunk)}\n\n`);
       }
-    } else if (currentEvent === 'message_delta' || chunk.type === 'message_delta') {
+    } else if (frame.event === 'message_delta' || chunk.type === 'message_delta') {
       const delta = isRecord(chunk.delta) ? chunk.delta : {};
       const usage = isRecord(chunk.usage) ? chunk.usage : {};
       outputTokens = numberOrZero(usage.output_tokens);
@@ -641,25 +689,8 @@ export async function* openaiEventsFromAnthropic(upstream: ReadableStream<Uint8A
     return out;
   };
 
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        for (const event of eventsOfFrame(frame)) yield event;
-        at = buffer.indexOf('\n\n');
-      }
-    }
-    buffer += decoder.decode();
-    if (buffer.trim() !== '') {
-      for (const event of eventsOfFrame(buffer)) yield event;
-    }
-  } finally {
-    reader.releaseLock();
+  for (const frame of frames) {
+    for (const event of processFrame(frame)) yield event;
   }
 
   if (!hasFinished) {
@@ -693,96 +724,66 @@ export async function* openaiEventsFromAnthropic(upstream: ReadableStream<Uint8A
 
 /** OpenAI events from Gemini upstream stream */
 export async function* openaiEventsFromGemini(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
+  const text = await collectStreamText(upstream);
+  const frames = parseSseFrames(text);
   const textPieces: string[] = [];
   let promptTokens = 0;
   let candidatesTokenCount = 0;
   let totalTokenCount = 0;
   let finishReasonGemini = 'STOP';
 
-  const readFrames = async () => {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        parseFrame(frame);
-        at = buffer.indexOf('\n\n');
-      }
+  for (const frame of frames) {
+    const payload = frame.data;
+    if (payload === '[DONE]') continue;
+    let chunk: unknown;
+    try {
+      chunk = JSON.parse(payload);
+    } catch {
+      continue;
     }
-    buffer += decoder.decode();
-    if (buffer.trim() !== '') {
-      parseFrame(buffer);
-    }
-  };
+    if (!isRecord(chunk)) continue;
 
-  const parseFrame = (frame: string) => {
-    for (const line of frame.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith('data:')) continue;
-      const payload = trimmed.slice(5).trim();
-      if (payload === '[DONE]') continue;
-      let chunk: unknown;
-      try {
-        chunk = JSON.parse(payload);
-      } catch {
-        continue;
-      }
-      if (!isRecord(chunk)) continue;
-
-      const candidates = Array.isArray(chunk.candidates) ? chunk.candidates : [];
-      if (candidates.length > 0) {
-        const cand = isRecord(candidates[0]) ? candidates[0] : {};
-        if (typeof cand.finishReason === 'string') finishReasonGemini = cand.finishReason;
-        const content = isRecord(cand.content) ? cand.content : {};
-        const parts = Array.isArray(content.parts) ? content.parts : [];
-        for (const p of parts) {
-          if (isRecord(p) && typeof p.text === 'string' && p.text !== '') {
-            textPieces.push(p.text);
-          }
+    const candidates = Array.isArray(chunk.candidates) ? chunk.candidates : [];
+    if (candidates.length > 0) {
+      const cand = isRecord(candidates[0]) ? candidates[0] : {};
+      if (typeof cand.finishReason === 'string') finishReasonGemini = cand.finishReason;
+      const content = isRecord(cand.content) ? cand.content : {};
+      const parts = Array.isArray(content.parts) ? content.parts : [];
+      for (const p of parts) {
+        if (isRecord(p) && typeof p.text === 'string' && p.text !== '') {
+          textPieces.push(p.text);
         }
       }
-
-      if (isRecord(chunk.usageMetadata)) {
-        const um = chunk.usageMetadata;
-        promptTokens = numberOrZero(um.promptTokenCount);
-        candidatesTokenCount = numberOrZero(um.candidatesTokenCount);
-        totalTokenCount = numberOrZero(um.totalTokenCount);
-      }
     }
-  };
 
-  try {
-    await readFrames();
-  } finally {
-    reader.releaseLock();
+    if (isRecord(chunk.usageMetadata)) {
+      const um = chunk.usageMetadata;
+      promptTokens = numberOrZero(um.promptTokenCount);
+      candidatesTokenCount = numberOrZero(um.candidatesTokenCount);
+      totalTokenCount = numberOrZero(um.totalTokenCount);
+    }
   }
 
   const chatCmplId = `chatcmpl-${Math.random().toString(36).slice(2, 9)}`;
 
-  for (const text of textPieces) {
+  for (const textPiece of textPieces) {
     const chunk = {
       id: chatCmplId,
       object: 'chat.completion.chunk',
       created: FIXED_OPENAI_CREATED,
       model,
-      choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+      choices: [{ index: 0, delta: { content: textPiece }, finish_reason: null }],
     };
     yield `data: ${JSON.stringify(chunk)}\n\n`;
   }
 
   const finishReason = finishReasonGemini === 'MAX_TOKENS' ? 'length' : 'stop';
   const finishChunk = {
-      id: chatCmplId,
-      object: 'chat.completion.chunk',
-      created: FIXED_OPENAI_CREATED,
-      model,
-      choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+    id: chatCmplId,
+    object: 'chat.completion.chunk',
+    created: FIXED_OPENAI_CREATED,
+    model,
+    choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
   };
   yield `data: ${JSON.stringify(finishChunk)}\n\n`;
 
@@ -805,72 +806,42 @@ export async function* openaiEventsFromGemini(upstream: ReadableStream<Uint8Arra
 
 /** Anthropic events from Gemini upstream stream */
 export async function* anthropicEventsFromGemini(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
+  const text = await collectStreamText(upstream);
+  const frames = parseSseFrames(text);
   const textPieces: string[] = [];
   let promptTokens = 0;
   let candidatesTokenCount = 0;
   let finishReasonGemini = 'STOP';
 
-  const readFrames = async () => {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        parseFrame(frame);
-        at = buffer.indexOf('\n\n');
-      }
+  for (const frame of frames) {
+    const payload = frame.data;
+    if (payload === '[DONE]') continue;
+    let chunk: unknown;
+    try {
+      chunk = JSON.parse(payload);
+    } catch {
+      continue;
     }
-    buffer += decoder.decode();
-    if (buffer.trim() !== '') {
-      parseFrame(buffer);
-    }
-  };
+    if (!isRecord(chunk)) continue;
 
-  const parseFrame = (frame: string) => {
-    for (const line of frame.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith('data:')) continue;
-      const payload = trimmed.slice(5).trim();
-      if (payload === '[DONE]') continue;
-      let chunk: unknown;
-      try {
-        chunk = JSON.parse(payload);
-      } catch {
-        continue;
-      }
-      if (!isRecord(chunk)) continue;
-
-      const candidates = Array.isArray(chunk.candidates) ? chunk.candidates : [];
-      if (candidates.length > 0) {
-        const cand = isRecord(candidates[0]) ? candidates[0] : {};
-        if (typeof cand.finishReason === 'string') finishReasonGemini = cand.finishReason;
-        const content = isRecord(cand.content) ? cand.content : {};
-        const parts = Array.isArray(content.parts) ? content.parts : [];
-        for (const p of parts) {
-          if (isRecord(p) && typeof p.text === 'string' && p.text !== '') {
-            textPieces.push(p.text);
-          }
+    const candidates = Array.isArray(chunk.candidates) ? chunk.candidates : [];
+    if (candidates.length > 0) {
+      const cand = isRecord(candidates[0]) ? candidates[0] : {};
+      if (typeof cand.finishReason === 'string') finishReasonGemini = cand.finishReason;
+      const content = isRecord(cand.content) ? cand.content : {};
+      const parts = Array.isArray(content.parts) ? content.parts : [];
+      for (const p of parts) {
+        if (isRecord(p) && typeof p.text === 'string' && p.text !== '') {
+          textPieces.push(p.text);
         }
       }
-
-      if (isRecord(chunk.usageMetadata)) {
-        const um = chunk.usageMetadata;
-        promptTokens = numberOrZero(um.promptTokenCount);
-        candidatesTokenCount = numberOrZero(um.candidatesTokenCount);
-      }
     }
-  };
 
-  try {
-    await readFrames();
-  } finally {
-    reader.releaseLock();
+    if (isRecord(chunk.usageMetadata)) {
+      const um = chunk.usageMetadata;
+      promptTokens = numberOrZero(um.promptTokenCount);
+      candidatesTokenCount = numberOrZero(um.candidatesTokenCount);
+    }
   }
 
   yield sseEvent('message_start', {
@@ -893,11 +864,11 @@ export async function* anthropicEventsFromGemini(upstream: ReadableStream<Uint8A
     content_block: { type: 'text', text: '' },
   });
 
-  for (const text of textPieces) {
+  for (const textPiece of textPieces) {
     yield sseEvent('content_block_delta', {
       type: 'content_block_delta',
       index: 0,
-      delta: { type: 'text_delta', text },
+      delta: { type: 'text_delta', text: textPiece },
     });
   }
 
@@ -918,10 +889,10 @@ export async function* anthropicEventsFromGemini(upstream: ReadableStream<Uint8A
   });
 }
 
+/** Anthropic events from OpenAI upstream stream */
 export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
+  const text = await collectStreamText(upstream);
+  const frames = parseSseFrames(text);
   let started = false;
   let finished = false;
   let pendingStop: string | null = null;
@@ -970,97 +941,101 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
     ];
   };
 
-  const eventsOfFrame = (frame: string): string[] => {
+  const processFrame = (frame: SseFrame): string[] => {
     const out: string[] = [];
-    for (const line of frame.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith('data:')) continue;
-      const payload = trimmed.slice(5).trim();
-      if (payload === '[DONE]') {
-        out.push(...startEvents(), ...finishEvents(pendingStop ?? 'end_turn'));
-        continue;
-      }
-      let chunk: unknown;
-      try {
-        chunk = JSON.parse(payload);
-      } catch {
-        continue;
-      }
-      if (!isRecord(chunk)) continue;
-      if (isRecord(chunk.usage)) {
-        inputTokens = numberOrZero(chunk.usage.prompt_tokens);
-        outputTokens = numberOrZero(chunk.usage.completion_tokens);
-      }
-      const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
-      const choice = isRecord(choices[0]) ? choices[0] : null;
-      if (choice === null) continue;
-      const delta = isRecord(choice.delta) ? choice.delta : {};
-      out.push(...startEvents());
-      if (typeof delta.content === 'string' && delta.content !== '') {
-        if (textIndex === -1) {
-          textIndex = nextIndex;
-          nextIndex += 1;
-          out.push(sseEvent('content_block_start', { type: 'content_block_start', index: textIndex, content_block: { type: 'text', text: '' } }));
-        }
-        out.push(sseEvent('content_block_delta', { type: 'content_block_delta', index: textIndex, delta: { type: 'text_delta', text: delta.content } }));
-      }
-      const calls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
-      for (const call of calls) {
-        if (!isRecord(call)) continue;
-        const upstreamIndex = typeof call.index === 'number' ? call.index : toolIndexes.size;
-        let index = toolIndexes.get(upstreamIndex);
-        if (index === undefined) {
-          if (textIndex !== -1) {
-            out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
-            textIndex = -1;
-          }
-          index = nextIndex;
-          nextIndex += 1;
-          toolIndexes.set(upstreamIndex, index);
-          const fn = isRecord(call.function) ? call.function : {};
-          out.push(
-            sseEvent('content_block_start', {
-              type: 'content_block_start',
-              index,
-              content_block: {
-                type: 'tool_use',
-                id: typeof call.id === 'string' && call.id !== '' ? call.id : `toolu_${index}`,
-                name: typeof fn.name === 'string' ? fn.name : '',
-                input: {},
-              },
-            }),
-          );
-        }
-        const fn = isRecord(call.function) ? call.function : {};
-        if (typeof fn.arguments === 'string' && fn.arguments !== '') {
-          out.push(sseEvent('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: fn.arguments } }));
-        }
-      }
-      if (choice.finish_reason !== null && choice.finish_reason !== undefined) pendingStop = stopReasonOf(choice.finish_reason);
+    const payload = frame.data;
+    if (payload === '[DONE]') {
+      out.push(...startEvents(), ...finishEvents(pendingStop ?? 'end_turn'));
+      return out;
     }
+    let chunk: unknown;
+    try {
+      chunk = JSON.parse(payload);
+    } catch {
+      return out;
+    }
+    if (!isRecord(chunk)) return out;
+    if (isRecord(chunk.usage)) {
+      inputTokens = numberOrZero(chunk.usage.prompt_tokens);
+      outputTokens = numberOrZero(chunk.usage.completion_tokens);
+    }
+    const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+    const choice = isRecord(choices[0]) ? choices[0] : null;
+    if (choice === null) return out;
+    const delta = isRecord(choice.delta) ? choice.delta : {};
+    out.push(...startEvents());
+    if (typeof delta.content === 'string' && delta.content !== '') {
+      if (textIndex === -1) {
+        textIndex = nextIndex;
+        nextIndex += 1;
+        out.push(sseEvent('content_block_start', { type: 'content_block_start', index: textIndex, content_block: { type: 'text', text: '' } }));
+      }
+      out.push(sseEvent('content_block_delta', { type: 'content_block_delta', index: textIndex, delta: { type: 'text_delta', text: delta.content } }));
+    }
+    const calls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+    for (const call of calls) {
+      if (!isRecord(call)) continue;
+      const upstreamIndex = typeof call.index === 'number' ? call.index : toolIndexes.size;
+      let index = toolIndexes.get(upstreamIndex);
+      if (index === undefined) {
+        if (textIndex !== -1) {
+          out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
+          textIndex = -1;
+        }
+        index = nextIndex;
+        nextIndex += 1;
+        toolIndexes.set(upstreamIndex, index);
+        const fn = isRecord(call.function) ? call.function : {};
+        out.push(
+          sseEvent('content_block_start', {
+            type: 'content_block_start',
+            index,
+            content_block: {
+              type: 'tool_use',
+              id: typeof call.id === 'string' && call.id !== '' ? call.id : `toolu_${index}`,
+              name: typeof fn.name === 'string' ? fn.name : '',
+              input: {},
+            },
+          }),
+        );
+      }
+      const fn = isRecord(call.function) ? call.function : {};
+      if (typeof fn.arguments === 'string' && fn.arguments !== '') {
+        out.push(sseEvent('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: fn.arguments } }));
+      }
+    }
+    if (choice.finish_reason !== null && choice.finish_reason !== undefined) pendingStop = stopReasonOf(choice.finish_reason);
     return out;
   };
 
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        for (const event of eventsOfFrame(frame)) yield event;
-        at = buffer.indexOf('\n\n');
-      }
-    }
-    buffer += decoder.decode();
-    if (buffer.trim() !== '') for (const event of eventsOfFrame(buffer)) yield event;
-  } finally {
-    reader.releaseLock();
+  for (const frame of frames) {
+    for (const event of processFrame(frame)) yield event;
   }
   if (!finished) {
     for (const event of startEvents()) yield event;
     for (const event of finishEvents(pendingStop ?? 'end_turn')) yield event;
+  }
+}
+
+/** OpenAI events from OpenAI upstream stream */
+export async function* openaiEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  const text = await collectStreamText(upstream);
+  const frames = parseSseFrames(text);
+  for (const frame of frames) {
+    const payload = frame.data;
+    if (payload === '[DONE]') {
+      yield `data: [DONE]\n\n`;
+      continue;
+    }
+    let chunk: unknown;
+    try {
+      chunk = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    if (isRecord(chunk)) {
+      chunk.model = model;
+      yield `data: ${JSON.stringify(chunk)}\n\n`;
+    }
   }
 }
