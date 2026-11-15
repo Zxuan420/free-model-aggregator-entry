@@ -20,6 +20,7 @@ import {
 } from './lib/providers.ts';
 import {
   anthropicError,
+  anthropicEventsFromGemini,
   anthropicEventsFromOpenAI,
   anthropicModelList,
   anthropicToOpenAI,
@@ -32,6 +33,8 @@ import {
   openAIToAnthropic,
   openAIToAnthropicRequest,
   openAItoGemini,
+  openaiEventsFromAnthropic,
+  openaiEventsFromGemini,
   type ServedModel,
 } from './lib/wire.ts';
 
@@ -213,6 +216,9 @@ async function callProvider(
     } else {
       bodyJson = anthropicToOpenAI(clientBody, model.id);
     }
+    if (bodyJson.stream === true) {
+      bodyJson.stream_options = { ...(isRecord(bodyJson.stream_options) ? bodyJson.stream_options : {}), include_usage: true };
+    }
   } else if (probe.provider.wire === 'anthropic') {
     url = `${base}/v1/messages`;
     headers['anthropic-version'] = '2023-06-01';
@@ -314,18 +320,19 @@ async function handleInference(
         if (clientApi === 'anthropic') {
           if (providerWire === 'openai') {
             for await (const event of anthropicEventsFromOpenAI(upstream.body, requestedModel)) res.write(event);
-          } else {
-            // Anthropic or Gemini stream -> Anthropic client
+          } else if (providerWire === 'anthropic') {
             const reader = upstream.body.getReader();
-            const decoder = new TextDecoder();
-            let buf = '';
-            for (;;) {
-              const { value, done } = await reader.read();
-              if (done) break;
-              buf += decoder.decode(value, { stream: true });
-              // Simple pass-through or translation for SSE
-              res.write(value);
+            try {
+              for (;;) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                res.write(value);
+              }
+            } finally {
+              reader.releaseLock();
             }
+          } else if (providerWire === 'gemini') {
+            for await (const event of anthropicEventsFromGemini(upstream.body, requestedModel)) res.write(event);
           }
         } else {
           // OpenAI client request
@@ -340,17 +347,10 @@ async function handleInference(
             } finally {
               reader.releaseLock();
             }
-          } else {
-            // Anthropic or Gemini stream -> OpenAI client
-            const reader = upstream.body.getReader();
-            const decoder = new TextDecoder();
-            let buf = '';
-            for (;;) {
-              const { value, done } = await reader.read();
-              if (done) break;
-              buf += decoder.decode(value, { stream: true });
-              res.write(value);
-            }
+          } else if (providerWire === 'anthropic') {
+            for await (const event of openaiEventsFromAnthropic(upstream.body, requestedModel)) res.write(event);
+          } else if (providerWire === 'gemini') {
+            for await (const event of openaiEventsFromGemini(upstream.body, requestedModel)) res.write(event);
           }
         }
       }

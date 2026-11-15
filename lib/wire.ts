@@ -304,17 +304,21 @@ export function openAIToAnthropicRequest(body: Json, model: string): Json {
     } else {
       for (const block of content) {
         if (!isRecord(block)) continue;
-        const part = partOf(block);
-        if (part !== null) {
-          if (part.type === 'text') blocks.push({ type: 'text', text: part.text });
-          else if (part.type === 'image_url') {
-            const url = isRecord(part.image_url) ? String(part.image_url.url) : '';
-            if (url.startsWith('data:')) {
-              const match = /^data:([^;]+);base64,(.+)$/.exec(url);
-              if (match) blocks.push({ type: 'image', source: { type: 'base64', media_type: match[1], data: match[2] } });
+        if (block.type === 'text' && typeof block.text === 'string') {
+          blocks.push({ type: 'text', text: block.text });
+        } else if (block.type === 'image_url' && isRecord(block.image_url) && typeof block.image_url.url === 'string') {
+          const url = block.image_url.url;
+          if (url.startsWith('data:')) {
+            const parts = url.split(';base64,', 2);
+            if (parts.length === 2) {
+              const media = parts[0].slice(5);
+              const data = parts[1];
+              blocks.push({ type: 'image', source: { type: 'base64', media_type: media, data } });
             } else {
               blocks.push({ type: 'image', source: { type: 'url', url } });
             }
+          } else {
+            blocks.push({ type: 'image', source: { type: 'url', url } });
           }
         }
       }
@@ -573,6 +577,347 @@ export function sseEvent(event: string | null, data: unknown): string {
 }
 
 /** Anthropic events from OpenAI upstream stream (already in starter, keep) */
+/** OpenAI events from Anthropic upstream stream */
+export async function* openaiEventsFromAnthropic(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  const reader = upstream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let stopReason = 'stop';
+  let hasFinished = false;
+
+  const chatCmplId = `chatcmpl-${Math.random().toString(36).slice(2, 9)}`;
+
+  const eventsOfFrame = (frame: string): string[] => {
+    const out: string[] = [];
+    let currentEvent: string | null = null;
+    let dataPayload: string | null = null;
+
+    for (const line of frame.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('event:')) {
+        currentEvent = trimmed.slice(6).trim();
+      } else if (trimmed.startsWith('data:')) {
+        dataPayload = trimmed.slice(5).trim();
+      }
+    }
+
+    if (dataPayload === null) return out;
+
+    let chunk: unknown;
+    try {
+      chunk = JSON.parse(dataPayload);
+    } catch {
+      return out;
+    }
+    if (!isRecord(chunk)) return out;
+
+    if (currentEvent === 'message_start' || chunk.type === 'message_start') {
+      const msg = isRecord(chunk.message) ? chunk.message : {};
+      const usage = isRecord(msg.usage) ? msg.usage : {};
+      inputTokens = numberOrZero(usage.input_tokens);
+    } else if (currentEvent === 'content_block_delta' || chunk.type === 'content_block_delta') {
+      const delta = isRecord(chunk.delta) ? chunk.delta : {};
+      if (delta.type === 'text_delta' && typeof delta.text === 'string' && delta.text !== '') {
+        const openaiChunk = {
+          id: chatCmplId,
+          object: 'chat.completion.chunk',
+          created: FIXED_OPENAI_CREATED,
+          model,
+          choices: [{ index: 0, delta: { content: delta.text }, finish_reason: null }],
+        };
+        out.push(`data: ${JSON.stringify(openaiChunk)}\n\n`);
+      }
+    } else if (currentEvent === 'message_delta' || chunk.type === 'message_delta') {
+      const delta = isRecord(chunk.delta) ? chunk.delta : {};
+      const usage = isRecord(chunk.usage) ? chunk.usage : {};
+      outputTokens = numberOrZero(usage.output_tokens);
+      if (typeof delta.stop_reason === 'string') {
+        stopReason = stopReasonOf(delta.stop_reason);
+      }
+    }
+
+    return out;
+  };
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let at = buffer.indexOf('\n\n');
+      while (at !== -1) {
+        const frame = buffer.slice(0, at);
+        buffer = buffer.slice(at + 2);
+        for (const event of eventsOfFrame(frame)) yield event;
+        at = buffer.indexOf('\n\n');
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim() !== '') {
+      for (const event of eventsOfFrame(buffer)) yield event;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (!hasFinished) {
+    hasFinished = true;
+    const finishChunk = {
+      id: chatCmplId,
+      object: 'chat.completion.chunk',
+      created: FIXED_OPENAI_CREATED,
+      model,
+      choices: [{ index: 0, delta: {}, finish_reason: stopReason }],
+    };
+    yield `data: ${JSON.stringify(finishChunk)}\n\n`;
+
+    const usageChunk = {
+      id: chatCmplId,
+      object: 'chat.completion.chunk',
+      created: FIXED_OPENAI_CREATED,
+      model,
+      choices: [],
+      usage: {
+        prompt_tokens: inputTokens,
+        completion_tokens: outputTokens,
+        total_tokens: inputTokens + outputTokens,
+      },
+    };
+    yield `data: ${JSON.stringify(usageChunk)}\n\n`;
+
+    yield 'data: [DONE]\n\n';
+  }
+}
+
+/** OpenAI events from Gemini upstream stream */
+export async function* openaiEventsFromGemini(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  const reader = upstream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const textPieces: string[] = [];
+  let promptTokens = 0;
+  let candidatesTokenCount = 0;
+  let totalTokenCount = 0;
+  let finishReasonGemini = 'STOP';
+
+  const readFrames = async () => {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let at = buffer.indexOf('\n\n');
+      while (at !== -1) {
+        const frame = buffer.slice(0, at);
+        buffer = buffer.slice(at + 2);
+        parseFrame(frame);
+        at = buffer.indexOf('\n\n');
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim() !== '') {
+      parseFrame(buffer);
+    }
+  };
+
+  const parseFrame = (frame: string) => {
+    for (const line of frame.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const payload = trimmed.slice(5).trim();
+      if (payload === '[DONE]') continue;
+      let chunk: unknown;
+      try {
+        chunk = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      if (!isRecord(chunk)) continue;
+
+      const candidates = Array.isArray(chunk.candidates) ? chunk.candidates : [];
+      if (candidates.length > 0) {
+        const cand = isRecord(candidates[0]) ? candidates[0] : {};
+        if (typeof cand.finishReason === 'string') finishReasonGemini = cand.finishReason;
+        const content = isRecord(cand.content) ? cand.content : {};
+        const parts = Array.isArray(content.parts) ? content.parts : [];
+        for (const p of parts) {
+          if (isRecord(p) && typeof p.text === 'string' && p.text !== '') {
+            textPieces.push(p.text);
+          }
+        }
+      }
+
+      if (isRecord(chunk.usageMetadata)) {
+        const um = chunk.usageMetadata;
+        promptTokens = numberOrZero(um.promptTokenCount);
+        candidatesTokenCount = numberOrZero(um.candidatesTokenCount);
+        totalTokenCount = numberOrZero(um.totalTokenCount);
+      }
+    }
+  };
+
+  try {
+    await readFrames();
+  } finally {
+    reader.releaseLock();
+  }
+
+  const chatCmplId = `chatcmpl-${Math.random().toString(36).slice(2, 9)}`;
+
+  for (const text of textPieces) {
+    const chunk = {
+      id: chatCmplId,
+      object: 'chat.completion.chunk',
+      created: FIXED_OPENAI_CREATED,
+      model,
+      choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+    };
+    yield `data: ${JSON.stringify(chunk)}\n\n`;
+  }
+
+  const finishReason = finishReasonGemini === 'MAX_TOKENS' ? 'length' : 'stop';
+  const finishChunk = {
+      id: chatCmplId,
+      object: 'chat.completion.chunk',
+      created: FIXED_OPENAI_CREATED,
+      model,
+      choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+  };
+  yield `data: ${JSON.stringify(finishChunk)}\n\n`;
+
+  const usageChunk = {
+    id: chatCmplId,
+    object: 'chat.completion.chunk',
+    created: FIXED_OPENAI_CREATED,
+    model,
+    choices: [],
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: candidatesTokenCount,
+      total_tokens: totalTokenCount > 0 ? totalTokenCount : promptTokens + candidatesTokenCount,
+    },
+  };
+  yield `data: ${JSON.stringify(usageChunk)}\n\n`;
+
+  yield 'data: [DONE]\n\n';
+}
+
+/** Anthropic events from Gemini upstream stream */
+export async function* anthropicEventsFromGemini(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  const reader = upstream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const textPieces: string[] = [];
+  let promptTokens = 0;
+  let candidatesTokenCount = 0;
+  let finishReasonGemini = 'STOP';
+
+  const readFrames = async () => {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let at = buffer.indexOf('\n\n');
+      while (at !== -1) {
+        const frame = buffer.slice(0, at);
+        buffer = buffer.slice(at + 2);
+        parseFrame(frame);
+        at = buffer.indexOf('\n\n');
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim() !== '') {
+      parseFrame(buffer);
+    }
+  };
+
+  const parseFrame = (frame: string) => {
+    for (const line of frame.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const payload = trimmed.slice(5).trim();
+      if (payload === '[DONE]') continue;
+      let chunk: unknown;
+      try {
+        chunk = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      if (!isRecord(chunk)) continue;
+
+      const candidates = Array.isArray(chunk.candidates) ? chunk.candidates : [];
+      if (candidates.length > 0) {
+        const cand = isRecord(candidates[0]) ? candidates[0] : {};
+        if (typeof cand.finishReason === 'string') finishReasonGemini = cand.finishReason;
+        const content = isRecord(cand.content) ? cand.content : {};
+        const parts = Array.isArray(content.parts) ? content.parts : [];
+        for (const p of parts) {
+          if (isRecord(p) && typeof p.text === 'string' && p.text !== '') {
+            textPieces.push(p.text);
+          }
+        }
+      }
+
+      if (isRecord(chunk.usageMetadata)) {
+        const um = chunk.usageMetadata;
+        promptTokens = numberOrZero(um.promptTokenCount);
+        candidatesTokenCount = numberOrZero(um.candidatesTokenCount);
+      }
+    }
+  };
+
+  try {
+    await readFrames();
+  } finally {
+    reader.releaseLock();
+  }
+
+  yield sseEvent('message_start', {
+    type: 'message_start',
+    message: {
+      id: 'msg_gemini_stream',
+      type: 'message',
+      role: 'assistant',
+      model,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: promptTokens, output_tokens: 0 },
+    },
+  });
+
+  yield sseEvent('content_block_start', {
+    type: 'content_block_start',
+    index: 0,
+    content_block: { type: 'text', text: '' },
+  });
+
+  for (const text of textPieces) {
+    yield sseEvent('content_block_delta', {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text },
+    });
+  }
+
+  yield sseEvent('content_block_stop', {
+    type: 'content_block_stop',
+    index: 0,
+  });
+
+  const stopReason = finishReasonGemini === 'MAX_TOKENS' ? 'max_tokens' : 'end_turn';
+  yield sseEvent('message_delta', {
+    type: 'message_delta',
+    delta: { stop_reason: stopReason, stop_sequence: null },
+    usage: { output_tokens: candidatesTokenCount },
+  });
+
+  yield sseEvent('message_stop', {
+    type: 'message_stop',
+  });
+}
+
 export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
